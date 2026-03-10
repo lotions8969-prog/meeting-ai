@@ -7,14 +7,10 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util';
 // ──────────────────────────────────────────────
 // Types
 // ──────────────────────────────────────────────
-type Stage = 'idle' | 'extracting' | 'transcribing' | 'generating' | 'done' | 'error';
+type Stage = 'setup' | 'idle' | 'extracting' | 'transcribing' | 'generating' | 'done' | 'error';
 type TabKey = 'minutes' | 'advice' | 'outline';
 
-interface Results {
-  minutes: string;
-  advice: string;
-  outline: string;
-}
+interface Results { minutes: string; advice: string; outline: string; }
 
 const TABS: { key: TabKey; label: string; icon: string; color: string }[] = [
   { key: 'minutes', label: '議事録', icon: '📋', color: 'from-blue-600 to-cyan-600' },
@@ -23,12 +19,12 @@ const TABS: { key: TabKey; label: string; icon: string; color: string }[] = [
 ];
 
 const ACCEPT = '.mp3,.mp4,.wav,.m4a,.webm,.mov,.avi,.ogg,.flac,.aac,.wma,.mkv';
-// 15-minute chunks at 24kbps ≈ 2.6MB (well under Vercel's 4.5MB limit)
 const CHUNK_SEC = 15 * 60;
-const FFMPEG_CORE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+const FFMPEG_CORE = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+const LS_KEY = 'meeting_ai_groq_key';
 
 // ──────────────────────────────────────────────
-// Minimal Markdown renderer
+// Markdown renderer
 // ──────────────────────────────────────────────
 function renderMd(md: string): string {
   return md
@@ -66,8 +62,22 @@ export default function Home() {
   const [ffmpegReady, setFfmpegReady] = useState(false);
   const [chunkInfo, setChunkInfo] = useState({ current: 0, total: 0 });
 
+  // API key state
+  const [groqKey, setGroqKey] = useState('');
+  const [keyInput, setKeyInput] = useState('');
+  const [showKeyPanel, setShowKeyPanel] = useState(false);
+  const [keyError, setKeyError] = useState('');
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const ffmpegRef = useRef<FFmpeg | null>(null);
+
+  // Load API key from localStorage on mount
+  useEffect(() => {
+    const saved = localStorage.getItem(LS_KEY) || '';
+    setGroqKey(saved);
+    setKeyInput(saved);
+    if (!saved) setShowKeyPanel(true);
+  }, []);
 
   // Load ffmpeg.wasm on mount
   useEffect(() => {
@@ -76,8 +86,8 @@ export default function Home() {
         const ff = new FFmpeg();
         ffmpegRef.current = ff;
         await ff.load({
-          coreURL: await toBlobURL(`${FFMPEG_CORE_URL}/ffmpeg-core.js`, 'text/javascript'),
-          wasmURL: await toBlobURL(`${FFMPEG_CORE_URL}/ffmpeg-core.wasm`, 'application/wasm'),
+          coreURL: await toBlobURL(`${FFMPEG_CORE}/ffmpeg-core.js`, 'text/javascript'),
+          wasmURL: await toBlobURL(`${FFMPEG_CORE}/ffmpeg-core.wasm`, 'application/wasm'),
         });
         setFfmpegReady(true);
       } catch (e) {
@@ -85,6 +95,18 @@ export default function Home() {
       }
     })();
   }, []);
+
+  const saveKey = () => {
+    const k = keyInput.trim();
+    if (!k.startsWith('gsk_')) {
+      setKeyError('Groq APIキーは "gsk_" で始まる形式です。確認してください。');
+      return;
+    }
+    setGroqKey(k);
+    localStorage.setItem(LS_KEY, k);
+    setShowKeyPanel(false);
+    setKeyError('');
+  };
 
   const reset = () => {
     setStage('idle');
@@ -97,7 +119,6 @@ export default function Home() {
     setChunkInfo({ current: 0, total: 0 });
   };
 
-  // Get media duration via HTML5 element
   const getDuration = (file: File): Promise<number> =>
     new Promise((resolve) => {
       const isVideo = file.type.startsWith('video/') ||
@@ -109,10 +130,8 @@ export default function Home() {
       el.src = url;
     });
 
-  // Extract audio chunks via ffmpeg.wasm
   const extractChunks = async (file: File): Promise<File[]> => {
     const ff = ffmpegRef.current!;
-
     setStatusMsg(`ファイルを解析中... (${(file.size / 1024 / 1024).toFixed(0)} MB)`);
     const duration = await getDuration(file);
     const numChunks = Math.max(1, Math.ceil(duration / CHUNK_SEC));
@@ -120,67 +139,50 @@ export default function Home() {
 
     setStatusMsg('音声データを読み込み中...');
     setProgress(5);
-
-    // Write the whole file to ffmpeg virtual FS
     await ff.writeFile('input', await fetchFile(file));
 
     const chunks: File[] = [];
-
     for (let i = 0; i < numChunks; i++) {
       setChunkInfo({ current: i + 1, total: numChunks });
       setStatusMsg(`音声を抽出・圧縮中 ${i + 1}/${numChunks}...`);
       setProgress(5 + Math.round((i / numChunks) * 90));
 
-      const start = i * CHUNK_SEC;
       const out = `chunk_${i}.mp3`;
-
-      await ff.exec([
-        '-i', 'input',
-        '-ss', String(start),
-        '-t', String(CHUNK_SEC),
-        '-vn',          // strip video
-        '-ar', '16000', // 16 kHz (speech range)
-        '-ac', '1',     // mono
-        '-b:a', '24k',  // 24 kbps → ~2.6 MB / 15 min (under Vercel 4.5 MB limit)
-        '-f', 'mp3',
-        out,
-      ]);
+      await ff.exec(['-i', 'input', '-ss', String(i * CHUNK_SEC), '-t', String(CHUNK_SEC),
+        '-vn', '-ar', '16000', '-ac', '1', '-b:a', '24k', '-f', 'mp3', out]);
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const data: any = await ff.readFile(out);
-      const blob = new Blob([data], { type: 'audio/mpeg' });
-      chunks.push(new File([blob], out, { type: 'audio/mpeg' }));
+      chunks.push(new File([new Blob([data], { type: 'audio/mpeg' })], out, { type: 'audio/mpeg' }));
       await ff.deleteFile(out);
     }
-
     try { await ff.deleteFile('input'); } catch { /* ignore */ }
     return chunks;
   };
 
+  const apiHeaders = () => ({ 'x-groq-key': groqKey });
+
   const processFile = async (file: File) => {
+    if (!groqKey) { setShowKeyPanel(true); return; }
     setFileName(file.name);
     setErrorMsg('');
 
     try {
-      // ── Step 1: Extract audio ──────────────────────
+      // ── Extract audio ──
       setStage('extracting');
       setProgress(0);
 
       let chunks: File[];
-
-      if (!ffmpegReady || !ffmpegRef.current) {
-        // ffmpeg not loaded: try uploading audio file directly
+      if (ffmpegReady && ffmpegRef.current) {
+        chunks = await extractChunks(file);
+      } else {
         const isAudio = file.type.startsWith('audio/');
         if (!isAudio) throw new Error('動画ファイルの処理には音声抽出エンジン（ffmpeg）が必要です。ページを再読み込みして再試行してください。');
-        if (file.size > 24 * 1024 * 1024) throw new Error('音声ファイルが大きすぎます（24MB以下にしてください）。ffmpegの読み込みを待ってから再試行してください。');
         chunks = [file];
-      } else {
-        chunks = await extractChunks(file);
       }
-
       setProgress(100);
 
-      // ── Step 2: Transcribe each chunk ─────────────
+      // ── Transcribe ──
       setStage('transcribing');
       const transcripts: string[] = [];
 
@@ -192,41 +194,41 @@ export default function Home() {
         const fd = new FormData();
         fd.append('audio', chunks[i]);
 
-        const res = await fetch('/api/transcribe', { method: 'POST', body: fd });
-        if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.error || '文字起こしに失敗しました');
-        }
-        const { text } = await res.json();
-        if (text) transcripts.push(text);
+        const res = await fetch('/api/transcribe', { method: 'POST', headers: apiHeaders(), body: fd });
+        const json = await res.json();
+
+        if (res.status === 401) throw new Error('Groq APIキーが無効です。正しいキーを入力してください。');
+        if (!res.ok) throw new Error(json.error || '文字起こしに失敗しました');
+        if (json.text) transcripts.push(json.text);
       }
       setProgress(100);
 
       const fullTranscript = transcripts.join(' ').trim();
       if (!fullTranscript) throw new Error('音声から文字が検出されませんでした。音声が明瞭か確認してください。');
 
-      // ── Step 3: Generate with Claude ──────────────
+      // ── Generate ──
       setStage('generating');
       setStatusMsg('AIが議事録・アドバイス・資料骨子を生成中...');
       setProgress(0);
 
       const genRes = await fetch('/api/generate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...apiHeaders() },
         body: JSON.stringify({ transcript: fullTranscript }),
       });
-      if (!genRes.ok) {
-        const err = await genRes.json();
-        throw new Error(err.error || 'AI生成に失敗しました');
-      }
+      const genJson = await genRes.json();
 
-      const genData = await genRes.json();
-      setResults(genData);
+      if (genRes.status === 401) throw new Error('Groq APIキーが無効です。正しいキーを入力してください。');
+      if (!genRes.ok) throw new Error(genJson.error || 'AI生成に失敗しました');
+
+      setResults(genJson);
       setActiveTab('minutes');
       setStage('done');
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : '処理中にエラーが発生しました');
+      const msg = err instanceof Error ? err.message : '処理中にエラーが発生しました';
+      setErrorMsg(msg);
       setStage('error');
+      if (msg.includes('APIキー')) setShowKeyPanel(true);
     }
   };
 
@@ -236,7 +238,7 @@ export default function Home() {
     const file = e.dataTransfer.files[0];
     if (file) processFile(file);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ffmpegReady]);
+  }, [groqKey, ffmpegReady]);
 
   const handleCopy = () => {
     if (!results) return;
@@ -250,45 +252,127 @@ export default function Home() {
     const k = key ?? activeTab;
     const label = TABS.find((t) => t.key === k)?.label ?? k;
     const content = `${label}\n\n${results[k].replace(/\\n/g, '\n')}`;
-    const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
-    const a = Object.assign(document.createElement('a'), { href: url, download: `${label}_${new Date().toLocaleDateString('ja-JP').replace(/\//g, '-')}.txt` });
+    const a = Object.assign(document.createElement('a'), {
+      href: URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' })),
+      download: `${label}_${new Date().toLocaleDateString('ja-JP').replace(/\//g, '-')}.txt`,
+    });
     a.click();
   };
 
   const handleDownloadAll = () => {
     if (!results) return;
     const all = TABS.map((t) => `${'='.repeat(40)}\n${t.icon} ${t.label}\n${'='.repeat(40)}\n\n${results[t.key].replace(/\\n/g, '\n')}`).join('\n\n');
-    const url = URL.createObjectURL(new Blob([all], { type: 'text/plain;charset=utf-8' }));
-    const a = Object.assign(document.createElement('a'), { href: url, download: `会議AIレポート_${new Date().toLocaleDateString('ja-JP').replace(/\//g, '-')}.txt` });
+    const a = Object.assign(document.createElement('a'), {
+      href: URL.createObjectURL(new Blob([all], { type: 'text/plain;charset=utf-8' })),
+      download: `会議AIレポート_${new Date().toLocaleDateString('ja-JP').replace(/\//g, '-')}.txt`,
+    });
     a.click();
   };
 
   const isProcessing = stage === 'extracting' || stage === 'transcribing' || stage === 'generating';
-
-  const STAGE_STEPS = [
+  const STEPS = [
     { key: 'extracting', label: '音声抽出' },
     { key: 'transcribing', label: '文字起こし' },
     { key: 'generating', label: 'AI生成' },
   ];
-  const stageIdx = STAGE_STEPS.findIndex((s) => s.key === stage);
+  const stageIdx = STEPS.findIndex((s) => s.key === stage);
 
-  // ── Render ───────────────────────────────────────
   return (
     <div className="min-h-screen bg-[#0a0f1e] text-white">
       {/* Ambient glows */}
       <div className="fixed inset-0 -z-10 overflow-hidden pointer-events-none">
         <div className="absolute -top-40 -left-40 w-96 h-96 bg-blue-600/10 rounded-full blur-3xl" />
         <div className="absolute -bottom-40 -right-40 w-96 h-96 bg-violet-600/10 rounded-full blur-3xl" />
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-indigo-600/5 rounded-full blur-3xl" />
       </div>
+
+      {/* ══════════════════════════════════
+          API KEY SETUP PANEL
+      ══════════════════════════════════ */}
+      {showKeyPanel && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+          <div className="w-full max-w-lg bg-slate-900 border border-slate-700 rounded-3xl p-8 shadow-2xl">
+            {/* Header */}
+            <div className="flex items-start gap-4 mb-6">
+              <div className="w-12 h-12 rounded-2xl bg-green-500/20 border border-green-500/30 flex items-center justify-center flex-shrink-0">
+                <svg className="w-6 h-6 text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+                </svg>
+              </div>
+              <div>
+                <h2 className="text-lg font-bold text-white">Groq APIキーを設定</h2>
+                <p className="text-slate-400 text-sm mt-0.5">無料・クレジットカード不要・2分で取得可能</p>
+              </div>
+            </div>
+
+            {/* Steps */}
+            <div className="bg-slate-800/60 rounded-2xl p-4 mb-5 space-y-3">
+              <p className="text-slate-300 text-sm font-medium mb-2">🆓 無料APIキーの取得方法</p>
+              {[
+                { n: '1', text: 'ブラウザで console.groq.com を開く' },
+                { n: '2', text: 'メールアドレスで無料登録（カード不要）' },
+                { n: '3', text: 'ダッシュボードで「API Keys」→「Create API Key」' },
+                { n: '4', text: '生成されたキー（gsk_...）を下にペースト' },
+              ].map(({ n, text }) => (
+                <div key={n} className="flex items-start gap-3">
+                  <span className="w-6 h-6 rounded-full bg-blue-500/20 border border-blue-500/30 text-blue-400 text-xs flex items-center justify-center flex-shrink-0 mt-0.5">{n}</span>
+                  <p className="text-slate-300 text-sm">{text}</p>
+                </div>
+              ))}
+
+              <a href="https://console.groq.com" target="_blank" rel="noopener noreferrer"
+                className="mt-2 flex items-center gap-2 text-blue-400 hover:text-blue-300 text-sm transition-colors">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+                console.groq.com を開く
+              </a>
+            </div>
+
+            {/* Free plan note */}
+            <div className="flex items-center gap-2 mb-5 p-3 rounded-xl bg-green-500/10 border border-green-500/20">
+              <svg className="w-4 h-4 text-green-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+              <p className="text-green-300 text-xs">無料プラン: 文字起こし7,200回/日 + AI生成14,400回/日 — 個人利用には十分すぎる量</p>
+            </div>
+
+            {/* Input */}
+            <div className="space-y-3">
+              <input
+                type="password"
+                value={keyInput}
+                onChange={(e) => setKeyInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && saveKey()}
+                placeholder="gsk_xxxxxxxxxxxxxxxxxxxx"
+                className="w-full px-4 py-3 rounded-xl bg-slate-800 border border-slate-600 focus:border-blue-500 focus:outline-none text-white placeholder-slate-500 text-sm font-mono"
+              />
+              {keyError && <p className="text-red-400 text-xs">{keyError}</p>}
+              <div className="flex gap-2">
+                <button onClick={saveKey}
+                  className="flex-1 py-3 rounded-xl bg-gradient-to-r from-blue-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 font-medium text-sm transition-all">
+                  保存して使い始める
+                </button>
+                {groqKey && (
+                  <button onClick={() => setShowKeyPanel(false)}
+                    className="px-4 py-3 rounded-xl bg-slate-700 hover:bg-slate-600 text-sm transition-all text-slate-300">
+                    閉じる
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="max-w-4xl mx-auto px-4 py-12">
 
         {/* ── Header ── */}
-        <div className="text-center mb-12">
-          <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-400 text-sm mb-5">
-            <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
-            Powered by OpenAI Whisper × Claude AI
+        <div className="text-center mb-10">
+          <div className="flex items-center justify-center gap-3 mb-4">
+            <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-400 text-sm">
+              <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
+              Groq Whisper × Llama 3.3 70B — 完全無料
+            </div>
           </div>
           <h1 className="text-4xl sm:text-5xl font-bold bg-gradient-to-r from-blue-400 via-violet-400 to-pink-400 bg-clip-text text-transparent mb-3">
             会議AI アシスタント
@@ -297,50 +381,78 @@ export default function Home() {
             音声・動画をアップロードするだけで<br className="sm:hidden" />
             <span className="text-slate-300 font-medium">議事録 / 提案アドバイス / 資料骨子</span>を自動生成
           </p>
-          <p className="text-slate-600 text-sm mt-2">
-            最大 2GB 対応 ・ ブラウザ内で音声抽出するためファイルがサーバーに送信されません
-          </p>
+
+          {/* Key status bar */}
+          <div className="flex items-center justify-center gap-3 mt-4">
+            {groqKey ? (
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-green-500/10 border border-green-500/20 text-green-400 text-xs">
+                <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                APIキー設定済み
+                <button onClick={() => setShowKeyPanel(true)} className="ml-1 text-slate-400 hover:text-white transition-colors">
+                  (変更)
+                </button>
+              </div>
+            ) : (
+              <button onClick={() => setShowKeyPanel(true)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs hover:bg-amber-500/20 transition-all">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                APIキーを設定してください（無料）
+              </button>
+            )}
+            <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs ${ffmpegReady ? 'bg-green-500/10 text-green-400 border border-green-500/20' : 'bg-slate-800 text-slate-500 border border-slate-700'}`}>
+              {ffmpegReady
+                ? <><span className="w-1.5 h-1.5 rounded-full bg-green-400" />音声エンジン Ready</>
+                : <><span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />音声エンジン読み込み中...</>
+              }
+            </div>
+          </div>
         </div>
 
         {/* ── IDLE STATE ── */}
-        {stage === 'idle' && (
+        {(stage === 'idle' || stage === 'error') && (
           <>
+            {stage === 'error' && (
+              <div className="mb-4 p-4 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-start gap-3">
+                <svg className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+                <div>
+                  <p className="text-red-300 font-medium text-sm">エラー</p>
+                  <p className="text-red-400 text-sm mt-0.5">{errorMsg}</p>
+                </div>
+                <button onClick={reset} className="ml-auto text-slate-500 hover:text-white transition-colors text-xs flex-shrink-0">閉じる</button>
+              </div>
+            )}
+
             <div
               onDrop={handleDrop}
               onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
               onDragLeave={() => setIsDragging(false)}
               onClick={() => fileInputRef.current?.click()}
               className={`relative border-2 border-dashed rounded-3xl p-12 text-center cursor-pointer transition-all duration-200 ${
-                isDragging ? 'border-blue-400 bg-blue-500/10 scale-[1.02]' : 'border-slate-700 hover:border-slate-500 bg-slate-900/40 hover:bg-slate-900/60'
+                isDragging ? 'border-blue-400 bg-blue-500/10 scale-[1.02]' :
+                !groqKey ? 'border-slate-700 opacity-60 cursor-not-allowed' :
+                'border-slate-700 hover:border-slate-500 bg-slate-900/40 hover:bg-slate-900/60'
               }`}
             >
               <input ref={fileInputRef} type="file" accept={ACCEPT} className="hidden"
                 onChange={(e) => e.target.files?.[0] && processFile(e.target.files[0])} />
 
-              <div className="mb-5">
-                <div className="inline-flex items-center justify-center w-20 h-20 rounded-2xl bg-gradient-to-br from-blue-500/20 to-violet-500/20 border border-slate-700 mb-1">
-                  <svg className="w-10 h-10 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                  </svg>
-                </div>
+              <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-blue-500/20 to-violet-500/20 border border-slate-700 flex items-center justify-center mx-auto mb-5">
+                <svg className="w-10 h-10 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                </svg>
               </div>
-
               <p className="text-xl font-semibold text-white mb-2">音声・動画ファイルをドロップ</p>
               <p className="text-slate-400 mb-4">または クリックしてファイルを選択（最大 2GB）</p>
-
-              <div className="flex flex-wrap justify-center gap-2 text-xs text-slate-500 mb-4">
-                {['MP3', 'MP4', 'WAV', 'M4A', 'MOV', 'WebM', 'AVI', 'FLAC', 'AAC', 'MKV', 'WMA'].map((f) => (
-                  <span key={f} className="px-2 py-1 rounded bg-slate-800 border border-slate-700">{f}</span>
+              <div className="flex flex-wrap justify-center gap-1.5 text-xs text-slate-500">
+                {['MP3', 'MP4', 'WAV', 'M4A', 'MOV', 'WebM', 'AVI', 'FLAC', 'AAC', 'MKV'].map((f) => (
+                  <span key={f} className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700">{f}</span>
                 ))}
               </div>
-
-              {/* ffmpeg status */}
-              <div className={`inline-flex items-center gap-1.5 text-xs px-3 py-1 rounded-full ${ffmpegReady ? 'bg-green-500/10 text-green-400 border border-green-500/20' : 'bg-slate-800 text-slate-500 border border-slate-700'}`}>
-                {ffmpegReady
-                  ? <><span className="w-1.5 h-1.5 rounded-full bg-green-400" />音声エンジン 準備完了</>
-                  : <><span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />音声エンジンを読み込み中...</>
-                }
-              </div>
+              {!groqKey && (
+                <p className="mt-4 text-amber-400 text-sm">↑ 上の「APIキーを設定」を先に完了してください</p>
+              )}
             </div>
 
             {/* Feature cards */}
@@ -365,9 +477,8 @@ export default function Home() {
         {/* ── PROCESSING STATE ── */}
         {isProcessing && (
           <div className="py-4">
-            {/* Step indicators */}
             <div className="flex items-center justify-center gap-1 mb-10 flex-wrap">
-              {STAGE_STEPS.map((s, i) => {
+              {STEPS.map((s, i) => {
                 const done = i < stageIdx;
                 const active = i === stageIdx;
                 return (
@@ -380,19 +491,15 @@ export default function Home() {
                         ? <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
                         : active
                         ? <span className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                        : <span className="w-2.5 h-2.5 rounded-full bg-slate-700" />
-                      }
+                        : <span className="w-2.5 h-2.5 rounded-full bg-slate-700" />}
                       {s.label}
                     </div>
-                    {i < STAGE_STEPS.length - 1 && (
-                      <div className={`w-6 h-px mx-1 ${i < stageIdx ? 'bg-green-500/40' : 'bg-slate-700'}`} />
-                    )}
+                    {i < STEPS.length - 1 && <div className={`w-6 h-px mx-1 ${i < stageIdx ? 'bg-green-500/40' : 'bg-slate-700'}`} />}
                   </div>
                 );
               })}
             </div>
 
-            {/* Processing card */}
             <div className="max-w-lg mx-auto bg-slate-900/60 border border-slate-800 rounded-3xl p-8 text-center">
               <div className="relative inline-flex mb-6">
                 <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-blue-500/20 to-violet-500/20 border border-slate-700 flex items-center justify-center">
@@ -416,13 +523,9 @@ export default function Home() {
               </div>
 
               <p className="font-medium text-white text-lg mb-1">{statusMsg}</p>
-
               {chunkInfo.total > 1 && (stage === 'extracting' || stage === 'transcribing') && (
-                <p className="text-slate-500 text-sm mb-4">
-                  チャンク {chunkInfo.current} / {chunkInfo.total}
-                </p>
+                <p className="text-slate-500 text-sm mb-4">チャンク {chunkInfo.current} / {chunkInfo.total}</p>
               )}
-
               {stage !== 'generating' && (
                 <div className="mt-4">
                   <div className="flex justify-between text-xs text-slate-600 mb-1.5">
@@ -435,47 +538,22 @@ export default function Home() {
                   </div>
                 </div>
               )}
-
-              {stage === 'extracting' && (
-                <p className="text-slate-600 text-xs mt-3">ブラウザ内で音声を抽出・圧縮しています。大きなファイルは数分かかります</p>
-              )}
+              {stage === 'extracting' && <p className="text-slate-600 text-xs mt-3">ブラウザ内で処理中。大きなファイルは数分かかります</p>}
               {stage === 'generating' && (
-                <div className="flex justify-center mt-4">
-                  <div className="flex gap-1">
-                    {[0, 1, 2].map((i) => (
-                      <span key={i} className="w-2 h-2 rounded-full bg-blue-400 animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
-                    ))}
-                  </div>
+                <div className="flex justify-center mt-4 gap-1">
+                  {[0, 1, 2].map((i) => (
+                    <span key={i} className="w-2 h-2 rounded-full bg-blue-400 animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
+                  ))}
                 </div>
               )}
-
-              {fileName && (
-                <p className="text-slate-600 text-xs mt-3 truncate">{fileName}</p>
-              )}
+              {fileName && <p className="text-slate-600 text-xs mt-3 truncate">{fileName}</p>}
             </div>
-          </div>
-        )}
-
-        {/* ── ERROR STATE ── */}
-        {stage === 'error' && (
-          <div className="max-w-md mx-auto py-12 text-center">
-            <div className="w-16 h-16 rounded-2xl bg-red-500/10 border border-red-500/30 flex items-center justify-center mx-auto mb-4">
-              <svg className="w-8 h-8 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              </svg>
-            </div>
-            <h3 className="text-lg font-semibold text-white mb-2">エラーが発生しました</h3>
-            <p className="text-red-400 text-sm mb-6 leading-relaxed">{errorMsg}</p>
-            <button onClick={reset} className="px-6 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-sm font-medium transition-all">
-              やり直す
-            </button>
           </div>
         )}
 
         {/* ── RESULTS STATE ── */}
         {stage === 'done' && results && (
           <div>
-            {/* Success banner */}
             <div className="flex items-center justify-between mb-6 p-4 rounded-2xl bg-green-500/10 border border-green-500/20">
               <div className="flex items-center gap-3">
                 <div className="w-8 h-8 rounded-xl bg-green-500/20 flex items-center justify-center flex-shrink-0">
@@ -496,14 +574,12 @@ export default function Home() {
                   </svg>
                   全て保存
                 </button>
-                <button onClick={reset}
-                  className="px-3 py-1.5 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/30 text-xs text-blue-400 transition-all">
+                <button onClick={reset} className="px-3 py-1.5 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 border border-blue-500/30 text-xs text-blue-400 transition-all">
                   新しいファイル
                 </button>
               </div>
             </div>
 
-            {/* Tabs */}
             <div className="flex gap-2 mb-4 overflow-x-auto pb-1">
               {TABS.map((tab) => (
                 <button key={tab.key} onClick={() => setActiveTab(tab.key)}
@@ -512,13 +588,11 @@ export default function Home() {
                       ? `bg-gradient-to-r ${tab.color} text-white shadow-lg`
                       : 'bg-slate-800/60 text-slate-400 hover:bg-slate-800 border border-slate-700'
                   }`}>
-                  <span>{tab.icon}</span>
-                  {tab.label}
+                  <span>{tab.icon}</span>{tab.label}
                 </button>
               ))}
             </div>
 
-            {/* Content card */}
             <div className="rounded-2xl bg-slate-900/60 border border-slate-800 overflow-hidden">
               <div className="flex items-center justify-between px-5 py-3 border-b border-slate-800 bg-slate-900/40">
                 <div className="flex items-center gap-2 text-sm text-slate-400">
@@ -542,7 +616,6 @@ export default function Home() {
                   </button>
                 </div>
               </div>
-
               <div className="p-6 min-h-[400px]"
                 dangerouslySetInnerHTML={{ __html: renderMd(results[activeTab]) }} />
             </div>
