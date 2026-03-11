@@ -7,7 +7,7 @@ import { fetchFile, toBlobURL } from '@ffmpeg/util';
 // ──────────────────────────────────────────────
 // Types
 // ──────────────────────────────────────────────
-type Stage = 'setup' | 'idle' | 'extracting' | 'transcribing' | 'generating' | 'done' | 'error';
+type Stage = 'idle' | 'extracting' | 'transcribing' | 'generating' | 'done' | 'error';
 type TabKey = 'minutes' | 'advice' | 'outline';
 
 interface Results { minutes: string; advice: string; outline: string; }
@@ -133,7 +133,9 @@ export default function Home() {
   const extractChunks = async (file: File): Promise<File[]> => {
     const ff = ffmpegRef.current!;
     setStatusMsg(`ファイルを解析中... (${(file.size / 1024 / 1024).toFixed(0)} MB)`);
-    const duration = await getDuration(file);
+    const rawDuration = await getDuration(file);
+    // Guard against NaN/Infinity (e.g. AVI/MKV unsupported by browser parser)
+    const duration = isFinite(rawDuration) && rawDuration > 0 ? rawDuration : 3600;
     const numChunks = Math.max(1, Math.ceil(duration / CHUNK_SEC));
     setChunkInfo({ current: 0, total: numChunks });
 
@@ -224,6 +226,8 @@ export default function Home() {
       setResults(genJson);
       setActiveTab('minutes');
       setStage('done');
+      // Reset file input so the same file can be re-uploaded
+      if (fileInputRef.current) fileInputRef.current.value = '';
     } catch (err) {
       const msg = err instanceof Error ? err.message : '処理中にエラーが発生しました';
       setErrorMsg(msg);
@@ -252,21 +256,25 @@ export default function Home() {
     const k = key ?? activeTab;
     const label = TABS.find((t) => t.key === k)?.label ?? k;
     const content = `${label}\n\n${results[k].replace(/\\n/g, '\n')}`;
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
     const a = Object.assign(document.createElement('a'), {
-      href: URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' })),
+      href: url,
       download: `${label}_${new Date().toLocaleDateString('ja-JP').replace(/\//g, '-')}.txt`,
     });
     a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const handleDownloadAll = () => {
     if (!results) return;
     const all = TABS.map((t) => `${'='.repeat(40)}\n${t.icon} ${t.label}\n${'='.repeat(40)}\n\n${results[t.key].replace(/\\n/g, '\n')}`).join('\n\n');
+    const url = URL.createObjectURL(new Blob([all], { type: 'text/plain;charset=utf-8' }));
     const a = Object.assign(document.createElement('a'), {
-      href: URL.createObjectURL(new Blob([all], { type: 'text/plain;charset=utf-8' })),
+      href: url,
       download: `会議AIレポート_${new Date().toLocaleDateString('ja-JP').replace(/\//g, '-')}.txt`,
     });
     a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const isProcessing = stage === 'extracting' || stage === 'transcribing' || stage === 'generating';

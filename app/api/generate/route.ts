@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
 
+export const maxDuration = 60;
+
 export async function POST(req: NextRequest) {
   const apiKey = req.headers.get('x-groq-key') || process.env.GROQ_API_KEY;
   if (!apiKey) {
@@ -12,7 +14,13 @@ export async function POST(req: NextRequest) {
     baseURL: 'https://api.groq.com/openai/v1',
   });
 
-  const { transcript } = await req.json();
+  let transcript: string;
+  try {
+    const body = await req.json();
+    transcript = body?.transcript;
+  } catch {
+    return NextResponse.json({ error: 'リクエストの形式が正しくありません' }, { status: 400 });
+  }
   if (!transcript) {
     return NextResponse.json({ error: 'transcript is required' }, { status: 400 });
   }

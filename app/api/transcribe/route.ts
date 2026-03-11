@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
 
+export const maxDuration = 60;
+
 export async function POST(req: NextRequest) {
   const apiKey = req.headers.get('x-groq-key') || process.env.GROQ_API_KEY;
   if (!apiKey) {
